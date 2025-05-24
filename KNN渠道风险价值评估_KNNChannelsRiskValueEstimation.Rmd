@@ -1,0 +1,392 @@
+---
+title: "KNN渠道价值风险评估"
+author: "YANG_HONG"
+date: "2025-04-10"
+output: slidy_presentation
+---
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(readxl)
+library(ggplot2)
+library(openxlsx)
+library(writexl)
+library(scales)
+library(ROSE)
+library(caret)
+library(DMwR)
+library(fastDummies)
+
+
+fn_drop_parentheses <- function(clean_parenses_a)
+  {
+    clean_parenses_a <- gsub("\\(.*\\)", "", clean_parenses_a)
+    clean_parenses_a <- gsub("\\（.*\\）", "", clean_parenses_a)
+    return(clean_parenses_a)
+  }
+  
+  #adjust ymd
+  fn_format_ymd <- function(date_a)
+  {
+    date_a <- as.Date(date_a, format = "%Y-%m-%d")
+    return(date_a)
+  }
+  
+  #adjust hours
+  fn_format_h <- function(time_a)
+  {
+    time_a <- format(as.POSIXct(time_a, format="%Y-%m-%d %H:%M:%S"),"%H")
+    return(time_a)
+  }
+
+```
+## 数据准备
+
+清洗数据后选择关键指标，
+要将渠道分群为“高价值低风险”、“低价值高风险”等类别，
+需要结合 
+价值指标（如销量、活跃度）和 风险指标（如逾期率、经营状态）
+
+
+###价值维度（Value）有
+   1.销量贡献  近1年销量、历史销量、周销量、近3月预审通过量 （反映渠道的销售能力及业务规模）
+   2.活跃度、活跃频次、近3月预审通过进件量 （高频活跃的渠道可能更稳定且价值高）
+   3.地域等级、市场等级 （高等级地区通常带来更高价值）
+
+###风险维度（Risk）
+   1. 逾期风险 近1年M1+逾期率、历史M1+逾期率、近1年逾期量、历史逾期量
+   2. 主体经营状态（如“关闭”可能代表高风险）
+   3. 初始生效日期、合作到期日期（计算合作时长，长期合作可能更稳定）
+   4. 主营品牌（某些品牌或车源可能风险更高）
+   5. 渠道二级科目（不同渠道属性，风险不同，比如4S店一般来说风险低于二手车店面）
+   
+  
+```{r}
+  
+setwd("D:/Chrome_download")
+
+channels <- read_xlsx("渠道管理列表.xlsx")
+
+channels <- channels %>%
+    rename_at('负责员工(金融顾问)', ~'负责员工') %>% 
+    mutate(负责员工 = fn_drop_parentheses(负责员工),
+           业务上级 = fn_drop_parentheses(业务上级),
+           初始生效日期 = ymd(初始生效日期),
+           渠道关停日期 = ymd(渠道关停日期)
+    )
+
+
+channels_tidyed <- channels %>% 
+  select(近1年销量, 历史销量, 周销量, 近3月预审通过量, 活跃度, 活跃频次, 近3月预审通过进件量,
+         活跃度, 活跃频次, 近3月预审通过进件量, 地域等级, 市场等级, 店面评级,
+         '近1年M1+逾期率', '历史M1+逾期率', 近1年逾期量, 历史逾期量, 主体经营状态, 初始生效日期, 主营品牌, 渠道二级科目
+         ) %>% 
+  mutate(
+    across( 
+      c(近1年销量, 历史销量, 周销量, 近3月预审通过量, 近3月预审通过进件量, 近1年逾期量, 历史逾期量, 活跃频次),
+      as.numeric)) %>% 
+  mutate(
+    across(
+      c(`近1年M1+逾期率`, `历史M1+逾期率`),
+      ~ parse_number(., "%") / 100  )# 自动解析百分比
+  ) %>% 
+  #填补空值,再归一化
+  mutate(近1年销量 = rescale(ifelse(is.na(近1年销量), 0, 近1年销量)),
+         历史销量 = rescale(ifelse(is.na(历史销量), 0, 历史销量)),
+         周销量 = rescale(ifelse(is.na(周销量), 0, 周销量)),
+         近3月预审通过量 = rescale(ifelse(is.na(近3月预审通过量), 0, 近3月预审通过量)),
+         活跃频次 = rescale(ifelse(is.na(活跃频次), 0, 活跃频次)),
+         近3月预审通过进件量 = rescale(ifelse(is.na(近3月预审通过进件量), 0, 近3月预审通过进件量)),
+         `近1年M1+逾期率` = rescale(ifelse(is.na(`近1年M1+逾期率`), 0, `近1年M1+逾期率`)),
+         `历史M1+逾期率` = rescale(ifelse(is.na(`历史M1+逾期率`), 0, `历史M1+逾期率`)),
+         近1年逾期量 = rescale(ifelse(is.na(近1年逾期量), 0, 近1年逾期量)),
+         历史逾期量 = rescale(ifelse(is.na(历史逾期量), 0, 历史逾期量)),
+         ) %>% 
+  #处理分类变量，factor
+  mutate(
+         店面评级 = as.factor(ifelse(is.na(店面评级), "nul", 店面评级)),
+         活跃度 = as.factor(ifelse(is.na(活跃度), "nul", 活跃度)),
+         地域等级 = as.factor(ifelse(is.na(地域等级), "nul", 地域等级)),
+         市场等级 = as.factor(ifelse(is.na(市场等级), "nul" , 市场等级)),
+         主体经营状态 = as.factor(ifelse(is.na(主体经营状态), "注销", 主体经营状态)),
+         #主营品牌 = as.factor(ifelse(is.na(主营品牌), "nul", 主营品牌)),
+         渠道二级科目 = as.factor(ifelse(is.na(渠道二级科目), "nul", 渠道二级科目))
+         ) %>% 
+  mutate(合作天数 = as.numeric(today() - 初始生效日期)) %>% 
+  mutate(合作天数 = rescale(ifelse(is.na(合作天数), 0, 合作天数))) %>% 
+  select(-初始生效日期, -主营品牌) %>% 
+  data.frame()
+
+
+
+
+glimpse(channels_tidyed)
+str(channels_tidyed)
+summary(channels_tidyed)
+sum(is.na(channels_tidyed))
+```
+
+
+
+```{r}
+#不平衡的问题----
+
+##转为as.numeric
+channels_tidyed <- as.data.frame(lapply(channels_tidyed, as.numeric))
+## 确保因变量是因子类型
+#channels_tidyed$店面评级 <- as.factor(channels_tidyed$店面评级)
+
+
+sample_index <- sample(nrow(channels_tidyed), round(nrow(channels_tidyed)* 0.75), replace = F)
+channels_train <- channels_tidyed[sample_index, ]
+channels_test <- channels_tidyed[-sample_index, ]
+
+#对比原来三个数据集不平衡的情况
+round(prop.table(table(select(channels_tidyed, 店面评级), exclude = NULL)), 4) * 100
+
+round(prop.table(table(select(channels_train, 店面评级), exclude = NULL)), 4) * 100
+
+round(prop.table(table(select(channels_test, 店面评级), exclude = NULL)), 4) * 100
+```
+
+分布不平衡，需要调整平衡
+
+
+```{r}
+#解决不平衡的问题----
+set.seed(1234)
+
+# 确保因变量是因子
+channels_train$店面评级 <- as.factor(channels_train$店面评级)
+
+# 检查类别分布
+table(channels_train$店面评级)
+
+# 检查是否有缺失值
+sum(is.na(channels_train))
+
+# 移除或填补缺失值
+channels_train <- channels_train[complete.cases(channels_train), ]
+
+
+#___选择合适的值
+
+# 检查类别分布
+class_counts <- table(channels_train$店面评级)
+min_class_size <- min(class_counts)  # 最小类别样本数
+max_class_size <- max(class_counts)  # 最大类别样本数
+
+# 如果目标是完全平衡
+perc.over <- ceiling((max_class_size / min_class_size - 1) * 100)
+perc.under <- ceiling((max_class_size / (min_class_size * (1 + perc.over / 100))) * 100)
+
+# 打印参数
+print(paste("perc.over:", perc.over))
+print(paste("perc.under:", perc.under))
+
+
+#——————选择合适的值
+
+
+
+
+# 使用 SMOTE 平衡数据--------------------------------------------------------
+channels_train <- DMwR::SMOTE(
+  店面评级 ~ ., 
+  data = channels_train, 
+  perc.over = perc.over,  # 少数类增加 200%
+  perc.under = perc.under  # 多数类减少到少数类的 150%
+)
+
+
+
+
+# 检查平衡后的类别分布
+table(channels_train$店面评级)
+
+round(prop.table(table(select(channels_train, 店面评级), exclude = NULL)), 4) * 100
+```
+
+
+
+
+
+
+
+```{r}
+channels_train_labels <- as.factor(pull(channels_train, 店面评级))
+channels_test_labels <- as.factor(pull(channels_test, 店面评级))
+
+
+channels_train <- data.frame(select(channels_train, -店面评级))
+channels_test <- data.frame(select(channels_test, -店面评级))
+```
+
+
+## 建立模型
+
+```{r}
+#-----------------------------------
+library(class)
+
+# 检查训练集是否有缺失值
+sum(is.na(channels_train))
+
+# 检查测试集是否有缺失值
+sum(is.na(channels_test))
+
+channels_train[is.na(channels_train)] <- colMeans(channels_train, na.rm = TRUE)
+
+
+k_values <- 1:20  # 你可以根据需要修改k的范围
+accuracy <- numeric(length(k_values))
+for(i in seq_along(k_values)) {
+  pred <- knn(
+    train = channels_train,
+    test = channels_test,
+    cl = channels_train_labels,
+    k = k_values[i]
+  )
+  # 让pred的levels与真实标签一致
+  pred <- factor(pred, levels = levels(channels_test_labels))
+  accuracy[i] <- mean(pred == channels_test_labels)
+}
+
+results <- data.frame(
+  k = k_values,
+  Accuracy = accuracy
+)
+
+
+
+
+# 可视化
+ggplot(results, aes(x = k, y = Accuracy)) +
+  geom_line(color = "steelblue", linewidth = 1) +
+  geom_point(color = "darkorange", size = 2) +
+  geom_text(aes(label = round(Accuracy, 2)), vjust = -0.7, size = 3.5, color = "black") +
+  scale_x_continuous(breaks = results$k) +
+  scale_y_continuous(limits = c(0.7, 1), labels = scales::percent_format(accuracy = 1)) +
+  labs(
+    title = "K value与预测准确率关系",
+    x = "K value",
+    y = "预测准确率"
+  ) +
+  theme_minimal(base_size = 10) +
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5, size = 18),
+    axis.title = element_text(face = "bold"),
+    axis.text = element_text(size = 12),
+    panel.grid.minor = element_blank()
+  )
+```
+
+
+#训练模型
+
+
+```{r}
+channels_pred1 <- knn(
+  train = channels_train,
+  test = channels_test,
+  cl = channels_train_labels,
+  k = 2 #根据需要输入K 值
+)
+
+
+head(channels_pred1)
+
+#强制设置预测结果的因子 levels 与真实标签一致
+channels_pred1 <- factor(channels_pred1, levels = levels(channels_test_labels))
+
+
+```
+
+
+#评估模型
+
+
+```{r}
+# 生成混淆矩阵对象
+cm <- confusionMatrix(channels_pred1, channels_test_labels)
+cm
+```
+
+
+从模型的输出结果看，还是不错的，93.7的准确率， 95%的置信区间也能到0.9以上，
+对于class 5的识别率能够到97%。识别非class5也能到96%的也能到，
+P-Value 也极小，是一个非常小的值，这表明模型的准确率显著高于通过简单地预测最常见类别所能达到的准确率。
+Kappa: 0.8129 模型性能很好，有很高的预测一致性。
+模型整体表现良好，准确率很高。然而，模型在预测类别 1 和类别 3 上的表现较差，主要是因为这些类别的样本数量较少可以看出）。模型在预测类别 5 上表现非常出色，是因为该类别在数据集中占主导地位。
+
+
+
+#模型可视化
+
+
+```{r}
+# 转为数据框
+
+
+
+
+
+cm_table <- as.data.frame(cm$table)
+colnames(cm_table) <- c("Prediction", "Reference", "Freq")
+
+# 绘制热力图
+(ggplot(data = cm_table, aes(x = Reference, y = Prediction, fill = Freq)) +
+  geom_tile(color = "white") +
+    
+  scale_fill_gradient(low = "white", high = "steelblue") +
+  geom_text(aes(label = Freq), vjust = 1) +
+  labs(title = "Confusion Matrix", x = "True label", y = "Predicted label"))
+
+
+cm_table <- as.data.frame(cm$table)
+cm_table$Correct <- cm_table$Prediction == cm_table$Reference
+
+
+
+
+
+
+ggplot(cm_table, aes(x=Reference, y=Freq, fill=Correct)) +
+  geom_bar(stat="identity", position="dodge") +
+  labs(title="Classification Results", x="True Label", y="Count") +
+  scale_fill_brewer(palette = "Set2") +
+  theme_minimal()
+```
+
+从模型的输出结果看，还是不错的，93.7的准确率， 95%的置信区间也能到0.9以上，
+对于class 5的识别率能够到97%。识别非class5也能到96%的也能到，
+P-Value 也极小，是一个非常小的值，这表明模型的准确率显著高于通过简单地预测最常见类别所能达到的准确率。
+Kappa: 0.8129 模型性能很好，有很高的预测一致性。
+模型整体表现良好，准确率很高。然而，模型在预测类别 1 和类别 3 上的表现较差，主要是因为这些类别的样本数量较少可以看出）。模型在预测类别 5 上表现非常出色，是因为该类别在数据集中占主导地位。
+
+
+#保存模型
+
+```{r}
+
+knn_model_meta <- list(
+  train_data = channels_train,
+  train_labels = channels_train_labels,
+  k_value = 2,  # 保存关键参数
+  normalization_params = list(  # 若有归一化参数需保存
+    mean = apply(channels_train, 2, mean),
+    sd = apply(channels_train, 2, sd)
+  )
+)
+
+# 使用压缩格式保存
+saveRDS(knn_model_meta, file = "knn_model_meta.rds", compress = "xz")
+
+# 重新加载时
+loaded_model <- readRDS("knn_model_meta.rds")
+```
+
+
+
+
+
